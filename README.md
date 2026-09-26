@@ -9,14 +9,22 @@
 观察入罐时「先域级、后全局」的淘汰过程——先清过期项，再按
 **优先级低 → 高、最近访问早 → 晚、创建序号小 → 大**逐条淘汰，并给出完整淘汰清单与排序依据。
 
+还支持 **Partitioned（CHIPS 独立分区 cookie）**：带 `Partitioned` 的 Set-Cookie 仅在同时带
+`Secure`、且写入时提供有效 http(s) 顶层页面 URL 时入罐，**分区键 = 该 URL 的 scheme +
+可注册域**（IP、localhost 用完整主机）；普通项与不同分区的同名同域同路径项并存，
+发送时只随分区键相同的顶层页面发送，其余分区项在排除明细中说明原因。
+
 技术栈：**TypeScript + Express + 原生 HTML/CSS/JS**（前端无框架、无构建），数据仅存内存；
 same-site 判定使用 [tldts](https://github.com/remusao/tldts)（内置公共后缀列表 PSL，含私有域段）。
 
 ---
 
-## 🚀 单条启动命令
+## 🚀 单条启动命令（Docker Compose）
 
-需要安装 Docker（含 Compose 插件）。在项目根目录执行：
+前置条件：安装 **Docker**（含 Compose 插件，Docker Desktop 或 Docker Engine +
+`docker-compose-plugin` 均可）。无需本机安装 Node.js。
+
+在**项目根目录**执行这一条命令即可完成构建并在后台启动 Web/API：
 
 ```bash
 docker compose up --build -d
@@ -26,14 +34,18 @@ docker compose up --build -d
 
 > **http://localhost:3000**
 
-- 容器内服务端口：**3000**
-- 宿主机默认映射端口：**3000**（想换端口改 `docker-compose.yml` 左侧，如 `"3001:3000"`）
+- Web 界面与全部 API（`/api/store`、`/api/send` 等）都在 **同一端口 localhost:3000** 提供；
+- 容器内服务端口：**3000**；
+- 宿主机默认映射端口：**3000**（想换端口改 `docker-compose.yml` 左侧，如 `"3001:3000"`）。
 
-停止与清理：
+常用命令：
 
 ```bash
-docker compose down          # 停止并删除容器（镜像保留）
-docker compose down --rmi local   # 同时删除本工具镜像
+docker compose logs -f          # 跟踪服务日志（看到「🍪 Cookie Jar Lab 已启动」即就绪）
+docker compose ps               # 查看运行状态
+docker compose down             # 停止并删除容器（镜像保留）
+docker compose down --rmi local # 同时删除本工具镜像
+docker compose up --build -d    # 改完代码后重新构建并启动
 ```
 
 > 不想用 Docker？见文末[不用 Docker 的本地运行](#不用-docker-的本地运行)。
@@ -48,15 +60,19 @@ docker compose down --rmi local   # 同时删除本工具镜像
    - 填「响应 URL」（cookie 来源页面），如 `https://shop.example.com/admin/dashboard?tab=1`
    - 填「单条 Set-Cookie」（**不要**带 `Set-Cookie:` 前缀），如：
      `session=abc123; Domain=example.com; Path=/; Max-Age=3600; Secure`
+   - 当 Set-Cookie 带 **`Partitioned`**（CHIPS）时，还需填「顶层页面 URL」
+     （如嵌入方页面 `https://embed.example.net/`）：分区键取它的 scheme + 可注册域；
+     普通 cookie 该栏留空即可
    - 点击 **入罐**，查看入罐 / 更新 / 删除 / 拒绝结果与原因
 2. **发起请求**：填请求 URL（如 `https://api.shop.example.com/orders/123/detail`），
-   并可指定 SameSite 判定上下文——**顶层页面 URL**（留空 = 与请求 URL 同站）、
+   并可指定 SameSite / 分区判定上下文——**顶层页面 URL**（留空 = 与请求 URL 同站/同分区）、
    **请求方法**、**是否顶层导航**；点击 **生成 Cookie 头**，查看：
-   - 最终 `Cookie:` 请求头（可一键复制）
+   - 最终 `Cookie:` 请求头（可一键复制）与本请求的**分区键**
    - 请求站 vs 顶层站（scheme + 可注册域）的同站/跨站结论
-   - 📤 **发送项**：命中的主机 / Path / Secure / SameSite 匹配点
-   - 🚫 **排除项**：过期、Domain 不匹配、Path 不匹配、Secure 受限、SameSite 拦截等逐项原因
-3. **🫙 当前 Cookie 罐**：右侧表格实时展示全部条目（域、作用域、Path、Secure、
+   - 📤 **发送项**：命中的主机 / Path / Secure / SameSite / 分区键匹配点
+   - 🚫 **排除项**：过期、Domain 不匹配、Path 不匹配、Secure 受限、SameSite 拦截、
+     **分区键不符（Partitioned）**等逐项原因
+3. **🫙 当前 Cookie 罐**：右侧表格实时展示全部条目（域、作用域、Path、**分区键**、Secure、
    Priority、有效期剩余、创建序号、**最近访问时间**）；点击 **重置** 清空内存罐。
 4. **🎚️ 容量压力模拟**（右栏顶部）：设置**全局容量**与**每个可注册域的容量**（按条目条数，
    留空 = 不限），点击 **应用容量设置** 立即按新上限执行一次淘汰；之后每次入罐通过校验都会
@@ -98,6 +114,11 @@ docker compose down --rmi local   # 同时删除本工具镜像
 | 10 | `https://example.com/` | `weird=1; Path=/; SameSite=Banana` | 入罐（非法值 → **默认 Lax** 并提示） |
 | 11 | `https://example.com/` | `cart=1; Path=/; Priority=Low` | 入罐（Priority=Low；容量超限时最先被淘汰） |
 | 12 | `https://example.com/` | `vip=1; Path=/; Priority=Nope` | 入罐（Priority 非法 → **Medium** 并提示） |
+| 13 | `https://widget.vendor.com/frame`（顶层页 `https://site-a.example/`） | `ch=1; Path=/; Secure; SameSite=None; Partitioned` | 入罐（**分区键 `https://site-a.example`**） |
+| 14 | 同上（顶层页 `https://site-b.example/`） | `ch=2; Path=/; Secure; SameSite=None; Partitioned` | 入罐（**另一分区，与第 13 条同名同域同路径并存**） |
+| 15 | `https://widget.vendor.com/frame`（顶层页留空） | `ch=3; Path=/; Secure; Partitioned` | **拒绝**：Partitioned 缺少有效顶层页面 URL |
+| 16 | `https://widget.vendor.com/frame`（顶层页 `https://site-a.example/`） | `ch=4; Path=/; Partitioned` | **拒绝**：Partitioned 未带 Secure |
+| 17 | `https://widget.vendor.com/frame`（顶层页 `https://site-a.example/`） | `ch=; Path=/; Secure; Partitioned; Max-Age=0` | **删除** site-a 分区的 ch；site-b 分区与普通项保留 |
 
 容量压力演算（右栏 **🎚️ 容量压力模拟**，或 `POST /api/capacity`）：
 
@@ -122,6 +143,18 @@ SameSite 演算示例（第 2 步的「顶层页面 URL / 方法 / 顶层导航�
 - 同上但方法 POST —— 显式 Lax 被排除；**默认 Lax**（如第 10 条的 `weird`）
   在创建 120 秒内仍放行（Lax+POST 宽限）
 - 同上但取消勾选顶层导航 —— 模拟子资源请求，跨站时只剩 `xs`（None）发送
+
+Partitioned（CHIPS）演算示例（写入时填「顶层页面 URL」，发送时由顶层页面 URL 计算请求分区键）：
+
+- 依次写入上表第 13、14 条（同名为 `ch`、同域同路径，分属 `site-a` / `site-b` 两个分区），
+  再写一条不带 `Partitioned` 的 `ch=u` —— 罐中共存 **3 条**；
+- 请求 `https://widget.vendor.com/`，顶层页 `https://site-b.example/` ——
+  **仅 site-b 分区项与普通项发送**，site-a 分区项在排除明细中给出
+  「条目分区键 … ≠ 请求分区键 …」；
+- 顶层页换成 `https://site-c.example/` —— 两个分区项都排除，**只剩普通项 `ch=u`**；
+- 顶层页留空 —— 请求分区键回退为请求站（`https://vendor.com`），分区项全部不匹配；
+- IP 顶层页（如 `http://192.168.1.6/`）分区键用完整主机且 scheme 参与：
+  换端口仍同分区，换 IP 或换 scheme 即跨分区。
 
 ---
 
@@ -150,8 +183,19 @@ SameSite 演算示例（第 2 步的「顶层页面 URL / 方法 / 顶层导航�
 - **Priority**（RFC 6265bis，仅参与容量淘汰，不影响发送）
   - 解析 `Low` / `Medium` / `High`（**大小写不敏感**）；
   - **缺省或非法值 → 按 Medium**（都会给出提示；缺省提示「按默认 Medium 参与容量淘汰」）。
-- **同名同域同路径**再次写入 → 覆盖更新，**沿用首次创建序号**（保证排序稳定），
-  并刷新该条目的最近访问时间。
+- **Partitioned**（CHIPS，RFC 6265bis 独立分区 cookie；无值标志属性）
+  - **入罐三个条件缺一不可**：声明了 `Partitioned`、**同时声明 `Secure`**、写入时提供的
+    **顶层页面 URL 是有效的 http(s) 地址**；任一不满足都**拒绝入罐**（普通 cookie 不受影响，
+    其顶层 URL 字段被忽略）；
+  - **分区键 = 顶层页面 URL 的 scheme + 可注册域（eTLD+1）**；IP、localhost 等无可注册域的
+    主机用**完整主机**（路径 / 端口 / 查询串不参与，scheme 参与，如
+    `https://www.embed.example.net:8443/app` → `https://embed.example.net`）；
+  - 分区键是**存储身份**的一部分：`(name, domain, path, partitionKey)` 才唯一确定一项，
+    因此**普通项与不同分区的同名同域同路径项并存**；覆盖更新与 `Max-Age <= 0` 删除都
+    **只影响对应分区**，不触及其他分区或普通项（删除不存在时明确说明「不影响其他分区」）；
+  - 分区项与普通项一样计入**域级与全局容量**，参与同一条淘汰排序。
+- **同名同域同路径（分区项还需同分区键）**再次写入 → 覆盖更新，**沿用首次创建序号**
+  （保证排序稳定），并刷新该条目的最近访问时间；普通项与各分区项互不覆盖。
 - **容量压力淘汰**（入罐通过以上全部校验后执行；未设置任何上限时完全不干预）
   - 可分别为每个**可注册域**（eTLD+1，tldts/PSL 判定；IP、localhost 按完整主机分桶）
     与**全局**设置条目数上限；
@@ -160,11 +204,12 @@ SameSite 演算示例（第 2 步的「顶层页面 URL / 方法 / 顶层导航�
     **Priority 低 → 高、最近访问早 → 晚、创建序号小 → 大**淘汰至回到上限；
   - **发送成功**的条目刷新最近访问时间，作为同级 Priority 的淘汰依据。
 
-### 发送（处理请求 URL + SameSite 上下文）
+### 发送（处理请求 URL + SameSite / 分区上下文）
 
-除请求 URL 外，演算还需要三个 SameSite 上下文参数（界面第 2 步）：
+除请求 URL 外，演算还需要三个上下文参数（界面第 2 步）：
 
-- **顶层页面 URL**：决定 same-site 的基准站；留空时视为与请求 URL 相同（同站）；
+- **顶层页面 URL**：同时决定 same-site 基准站与 **Partitioned 请求分区键**；
+  留空时视为与请求 URL 相同（同站、同分区）；
 - **请求方法**：GET / POST / …（大小写不敏感）；
 - **是否顶层导航**：地址栏/链接跳转属于顶层导航；子资源、iframe、fetch 不属于。
 
@@ -177,10 +222,13 @@ SameSite 演算示例（第 2 步的「顶层页面 URL / 方法 / 顶层导航�
 逐条检查（顺序与 RFC 6265 一致）：
 
 1. **过期检查**：已过期不发送（罐中保留并标灰显示）；
-2. **Domain 匹配**：host-only 仅精确匹配原主机；Domain cookie 匹配该域及其子域；
-3. **Path 匹配**：请求路径与 cookie-path 相等，或以其开头且边界字符是 `/`；
-4. **Secure 检查**：Secure cookie 只在 `https:` 请求中发送；
-5. **SameSite 检查**（仅跨站时拦截）：
+2. **分区检查（Partitioned / CHIPS）**：请求分区键由顶层页面 URL（缺省取请求 URL）按
+   scheme + 可注册域计算；**分区项只在自身分区键与请求分区键完全相同时继续后续检查**，
+   键不同直接排除并在明细给出两个键；普通（未分区）项不参与分区隔离，照常检查；
+3. **Domain 匹配**：host-only 仅精确匹配原主机；Domain cookie 匹配该域及其子域；
+4. **Path 匹配**：请求路径与 cookie-path 相等，或以其开头且边界字符是 `/`；
+5. **Secure 检查**：Secure cookie 只在 `https:` 请求中发送（分区项同样受此约束）；
+6. **SameSite 检查**（仅跨站时拦截）：
    - `Strict`：**仅同站发送**；
    - 显式 `Lax`：同站，或**跨站顶层导航的安全方法**（GET/HEAD/OPTIONS/TRACE）；
    - **默认 Lax**（未声明/非法值）：同上，另允许**创建不超过 120 秒的跨站顶层 POST**
@@ -200,8 +248,8 @@ SameSite 演算示例（第 2 步的「顶层页面 URL / 方法 / 顶层导航�
 | 方法 | 路径 | Body（JSON） | 说明 |
 |------|------|--------------|------|
 | GET | `/api/jar` | — | 当前罐快照（`cookies` + `capacity`：容量设置与各可注册域用量） |
-| POST | `/api/store` | `{ "url": "...", "setCookie": "..." }` | 顺序写入一条 Set-Cookie；响应含 `eviction`（本次触发的域级/全局淘汰清单与排序依据，无限额时为 `null`） |
-| POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true }` | 演算 Cookie 头与逐项原因；发送成功的条目刷新最近访问时间，响应附最新 `cookies` 与 `capacity` |
+| POST | `/api/store` | `{ "url": "...", "setCookie": "...", "topUrl"?: "..." }` | 顺序写入一条 Set-Cookie；`topUrl` 为顶层页面 URL，仅 `Partitioned` cookie 必需（计算分区键），普通 cookie 可省略。响应含 `eviction`（本次触发的域级/全局淘汰清单与排序依据，无限额时为 `null`） |
+| POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true }` | 演算 Cookie 头与逐项原因；请求分区键由顶层页面 URL（缺省取请求 URL）计算并以 `partitionKey` 返回，仅键相同的 `Partitioned` 项发送；发送成功的条目刷新最近访问时间，响应附最新 `cookies` 与 `capacity` |
 | POST | `/api/capacity` | `{ "globalLimit"?: number \| null, "domainLimits"?: { "example.com": 3 } }` | 替换式设置全局 / 每可注册域容量（正整数；`null`/缺省 = 不限），立即执行一轮淘汰并返回报告 |
 | POST | `/api/reset` | — | 清空内存罐（**容量设置保留**） |
 
@@ -213,6 +261,19 @@ curl -s -X POST http://localhost:3000/api/store \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://shop.example.com/admin/dashboard",
        "setCookie":"sid=abc; Domain=example.com; Path=/; Max-Age=3600; Secure; SameSite=Lax"}'
+
+# 写入 Partitioned（CHIPS）：必须带 Secure，并提供顶层页面 URL 计算分区键
+curl -s -X POST http://localhost:3000/api/store \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://widget.vendor.com/frame",
+       "setCookie":"ch=1; Path=/; Secure; SameSite=None; Partitioned",
+       "topUrl":"https://embed.example.net/"}'
+
+# 演算请求（partitionKey 回显请求分区键；仅分区键相同的 Partitioned 项发送）
+curl -s -X POST http://localhost:3000/api/send \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://widget.vendor.com/frame",
+       "topUrl":"https://embed.example.net/page", "method":"GET", "topLevelNav":true}'
 
 # 演算请求（跨站顶层导航 GET：Strict 被拦截，Lax/None 放行）
 curl -s -X POST http://localhost:3000/api/send \
@@ -245,9 +306,9 @@ curl -s -X POST http://localhost:3000/api/reset
 ├── tsconfig.json
 ├── src
 │   ├── server.ts           # Express 入口与 API（含容量设置接口）
-│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/容量淘汰）
+│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/容量淘汰）
 └── public
-    ├── index.html          # 原生前端页面（含容量压力配置面板）
+    ├── index.html          # 原生前端页面（含顶层 URL 输入与容量压力配置面板）
     ├── styles.css
     └── app.js
 ```
@@ -269,7 +330,10 @@ npm run dev
 ```
 
 > 说明：本工具是**演算/教学工具**，Cookie 仅存于服务端进程内存，刻意聚焦
-> Domain / Path / Max-Age / Secure / SameSite / Priority 与容量压力淘汰等规则；
+> Domain / Path / Max-Age / Secure / SameSite / Priority / **Partitioned（CHIPS 分区）**
+> 与容量压力淘汰等规则；
 > 不处理 HttpOnly 发送限制（仅展示标签）、Expires、单条 cookie 字节大小上限等。
+> 分区键与站点一致，取**顶层 URL 的 scheme + 可注册域**（IP、localhost 用完整主机），
+> 不实现浏览器额外的第三方 cookie 策略开关。
 > 容量按**条目条数**模拟（RFC 6265bis 的每可注册域 180 条、全局 3000 条同型机制），
 > 时间精度取毫秒级，同一毫秒内的次序由创建序号兜底。

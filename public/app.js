@@ -5,6 +5,7 @@ const $ = (sel) => document.querySelector(sel);
 
 const els = {
   storeUrl: $('#store-url'),
+  storeTopUrl: $('#store-top-url'),
   storeCookie: $('#store-cookie'),
   storeBtn: $('#store-btn'),
   fillDemo: $('#fill-demo'),
@@ -96,6 +97,12 @@ function priorityBadge(c) {
   return `<span class="badge ${cls}">Priority=${escapeHtml(c.priorityLabel)}</span>`;
 }
 
+function partitionBadge(c) {
+  if (!c.partitioned) return '<span class="badge part-none">未分区</span>';
+  return `<span class="badge part-on" title="分区键（scheme + 可注册域；IP、localhost 用完整主机）">` +
+    `Partitioned · ${escapeHtml(c.partitionKey)}</span>`;
+}
+
 function renderJar(cookies) {
   els.jarCount.textContent = String(cookies.length);
 
@@ -135,6 +142,9 @@ function renderJar(cookies) {
           <div class="dim">${escapeHtml(c.scope)}</div>
         </td>
         <td class="mono">${escapeHtml(c.path)}</td>
+        <td class="part-cell">
+          ${partitionBadge(c)}
+        </td>
         <td>
           ${secureBadge}${httpBadge}${sameSiteBadge(c)}${priorityBadge(c)}${lifeBadge}
           ${expiresLine}
@@ -148,7 +158,7 @@ function renderJar(cookies) {
     <table class="jar-table">
       <thead>
         <tr>
-          <th>#</th><th>Cookie</th><th>域 / 作用域</th><th>Path</th><th>属性 / 有效期 / 访问</th>
+          <th>#</th><th>Cookie</th><th>域 / 作用域</th><th>Path</th><th>分区</th><th>属性 / 有效期 / 访问</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
@@ -195,6 +205,9 @@ function evictedItemHtml(item) {
         ${tag}
         <span class="item-cookie">${escapeHtml(item.cookie)}</span>
         <span class="badge ${prCls}">Priority=${escapeHtml(item.priorityLabel)}</span>
+        ${item.partitioned
+          ? `<span class="badge part-on">Partitioned · ${escapeHtml(item.partitionKey)}</span>`
+          : '<span class="badge part-none">未分区</span>'}
         <span class="dim mono">${item.hostOnly ? 'host-only' : 'domain'} · ${escapeHtml(item.domain)} · ${escapeHtml(item.path)}</span>
       </div>
       <div class="item-detail">${escapeHtml(item.basis)}</div>
@@ -252,6 +265,9 @@ function renderStoreResult(data) {
 function itemHtml(item) {
   const sent = item.verdict === 'send';
   const ssCls = item.sameSite === 'strict' ? 'ss-strict' : item.sameSite === 'none' ? 'ss-none' : 'ss-lax';
+  const partBadge = item.partitioned
+    ? `<span class="badge part-on">Partitioned · ${escapeHtml(item.partitionKey)}</span>`
+    : '';
   return `
     <div class="item ${sent ? 'sent' : 'excluded'}">
       <div class="item-top">
@@ -259,6 +275,7 @@ function itemHtml(item) {
         <span class="tag ${sent ? 'send' : 'exclude'}">${sent ? '发送' : '排除'}</span>
         <span class="item-cookie">${escapeHtml(item.cookie)}</span>
         <span class="badge ${ssCls}">SameSite=${escapeHtml(item.sameSiteLabel)}</span>
+        ${partBadge}
       </div>
       <div class="item-detail">${escapeHtml(item.detail)}</div>
     </div>`;
@@ -304,6 +321,10 @@ function renderSendResult(data) {
       请求站 <code>${escapeHtml(data.requestSite)}</code> vs 顶层站 <code>${escapeHtml(data.topSite)}</code>
       ${siteBadge} · 方法 <code>${escapeHtml(data.method)}</code> · ${navText}
     </div>
+    <div class="meta-line">
+      🔑 请求分区键（顶层页面 URL 的 scheme + 可注册域）：<code>${escapeHtml(data.partitionKey)}</code>
+      <span class="dim">仅分区键相同的 Partitioned 项发送</span>
+    </div>
     <div class="header-block">
       <div class="header-line ${data.cookieHeader ? '' : 'empty'}">
         <span class="hname">Cookie:</span>
@@ -323,6 +344,7 @@ function renderSendResult(data) {
 els.storeBtn.addEventListener('click', async () => {
   const url = els.storeUrl.value.trim();
   const setCookie = els.storeCookie.value.trim();
+  const topUrl = els.storeTopUrl.value.trim();
   if (!url || !setCookie) {
     renderStoreResult({
       ok: false, action: 'rejected',
@@ -333,7 +355,7 @@ els.storeBtn.addEventListener('click', async () => {
   }
   els.storeBtn.disabled = true;
   try {
-    const data = await postJSON('/api/store', { url, setCookie });
+    const data = await postJSON('/api/store', { url, setCookie, topUrl });
     renderStoreResult(data);
   } catch (err) {
     renderStoreResult({
@@ -528,9 +550,10 @@ addCapDomainRow();
 
 els.fillDemo.addEventListener('click', () => {
   els.storeUrl.value = 'https://shop.example.com/admin/dashboard?tab=1';
-  els.storeCookie.value = 'session=abc123; Domain=example.com; Path=/; Max-Age=3600; Secure; SameSite=Lax; Priority=High';
+  els.storeTopUrl.value = 'https://embed.example.net/';
+  els.storeCookie.value = 'session=abc123; Domain=example.com; Path=/; Max-Age=3600; Secure; SameSite=Lax; Priority=High; Partitioned';
   els.sendUrl.value = 'https://api.shop.example.com/orders/123/detail';
-  els.sendTopUrl.value = 'https://shop.example.com/cart';
+  els.sendTopUrl.value = 'https://embed.example.net/page';
   els.sendMethod.value = 'GET';
   els.sendTopnav.checked = true;
 });
@@ -540,6 +563,9 @@ els.storeCookie.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') els.storeBtn.click();
 });
 els.storeUrl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.storeBtn.click();
+});
+els.storeTopUrl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') els.storeBtn.click();
 });
 els.sendUrl.addEventListener('keydown', (e) => {

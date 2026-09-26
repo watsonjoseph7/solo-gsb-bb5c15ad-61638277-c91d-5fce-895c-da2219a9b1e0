@@ -367,6 +367,14 @@ select:focus {
 .badge.ss-none { background: var(--green-bg); color: var(--green); }
 .badge.ss-same { background: var(--green-bg); color: var(--green); }
 .badge.ss-cross { background: var(--amber-bg); color: #f3c168; }
+/* Partitioned（CHIPS）分区徽章 */
+.badge.part-on {
+  background: rgba(45, 200, 190, 0.14);
+  color: #3fd0c4;
+  white-space: normal;
+}
+.badge.part-none { background: rgba(154,163,181,.12); color: var(--text-faint); }
+.jar-table td.part-cell { white-space: normal; }
 .domain-val { font-family: var(--mono); font-size: 11.5px; }
 .dim { color: var(--text-faint); font-size: 11.5px; }
 

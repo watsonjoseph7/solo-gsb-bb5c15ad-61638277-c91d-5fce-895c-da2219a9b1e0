@@ -440,6 +440,178 @@ post /api/reset '{}' >/dev/null
 post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 
 echo
+echo "------- Partitioned（CHIPS 独立分区）写入演算 -------"
+
+echo "== C1. Partitioned 未带 Secure -> 拒绝 =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/","setCookie":"ch=1; Path=/; Partitioned","topUrl":"https://site-a.example/"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（必须带 Secure）" "必须同时声明 Secure" "$R"
+
+echo "== C2. Partitioned 未提供顶层 URL -> 拒绝 =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/","setCookie":"ch=1; Path=/; Secure; Partitioned"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（缺少顶层 URL）" "顶层页面 URL" "$R"
+
+echo "== C3. Partitioned 顶层 URL 非法（非 http(s)）-> 拒绝 =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/","setCookie":"ch=1; Path=/; Secure; Partitioned","topUrl":"ftp://site-a.example/"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（URL 非法或非 http(s)）" "非法或非 http" "$R"
+
+echo "== C4. 普通 cookie 带不带 topUrl 都照常入罐（topUrl 被忽略） =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/","setCookie":"plain=1; Path=/; Secure","topUrl":"https://site-a.example/"}')
+check "普通项入罐" '"action":"stored"' "$R"
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+c=d['cookie']
+assert c['partitioned'] is False and c['partitionKey'] is None, c
+print('✅ 普通项 partitioned=false、partitionKey=null')" && PASS=$((PASS+1)) || { echo "❌ 普通项分区字段错误"; FAIL=$((FAIL+1)); }
+
+echo "== C5. Partitioned 合法入罐（分区键 site-a = scheme+可注册域，忽略路径/端口） =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/frame","setCookie":"ch=a; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://www.site-a.example:8443/home?q=1"}')
+check "入罐" '"action":"stored"' "$R"
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+c=d['cookie']
+assert c['partitioned'] is True, c
+assert c['partitionKey']=='https://site-a.example', c['partitionKey']
+print('✅ 分区键 https://site-a.example（去子域/端口/路径）')" && PASS=$((PASS+1)) || { echo "❌ 分区键计算错误"; FAIL=$((FAIL+1)); }
+check "入罐提示给出分区键" "分区键取顶层页面" "$R"
+
+echo "== C6. 另一分区同名同域同路径项并存（不是覆盖） =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/frame","setCookie":"ch=b; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://site-b.example/"}')
+check "入罐（非更新）" '"action":"stored"' "$R"
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+parts=sorted((c['value'],c['partitionKey']) for c in d['jar'] if c['name']=='ch')
+assert parts==[('a','https://site-a.example'),('b','https://site-b.example')], parts
+print('✅ 两个分区项并存')" && PASS=$((PASS+1)) || { echo "❌ 分区项未并存"; FAIL=$((FAIL+1)); }
+
+echo "== C7. 普通项同名同域同路径也并存 =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/frame","setCookie":"ch=u; Path=/; Secure; SameSite=None"}')
+check "普通项入罐（非更新）" '"action":"stored"' "$R"
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+rows=[c for c in d['cookies'] if c['name']=='ch']
+assert len(rows)==3, len(rows)
+labels=sorted(c['partitionLabel'] for c in rows)
+print('✅ 罐中 ch 共 3 条（2 分区 + 1 未分区）:', labels)" && PASS=$((PASS+1)) || { echo "❌ 普通项未与分区项并存"; FAIL=$((FAIL+1)); }
+
+echo "== C8. 同分区覆盖只更新该分区，沿用创建序号 =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/frame","setCookie":"ch=aa; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://site-a.example/"}')
+check "更新动作" '"action":"updated"' "$R"
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+assert d['inheritedIndex']==2, d
+vals=sorted((c['value'],str(c['partitionKey'])) for c in d['jar'] if c['name']=='ch')
+assert vals==[('aa','https://site-a.example'),('b','https://site-b.example'),('u','None')], vals
+print('✅ 仅 site-a 分区被覆盖为 aa，site-b 与普通项不变')" && PASS=$((PASS+1)) || { echo "❌ 覆盖越区"; FAIL=$((FAIL+1)); }
+
+echo "== C9. Max-Age=0 只删除对应分区 =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/frame","setCookie":"ch=; Path=/; Secure; Partitioned; Max-Age=0","topUrl":"https://site-a.example/"}')
+check "删除动作" '"action":"deleted"' "$R"
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+vals=sorted((c['value'],str(c['partitionKey'])) for c in d['jar'] if c['name']=='ch')
+assert vals==[('b','https://site-b.example'),('u','None')], vals
+print('✅ site-a 项删除，site-b 分区项与普通项保留')" && PASS=$((PASS+1)) || { echo "❌ 删除越区"; FAIL=$((FAIL+1)); }
+
+echo "== C10. 再次删除该分区：无可删除，不影响其他分区 =="
+R=$(post /api/store '{"url":"https://widget.vendor.com/","setCookie":"ch=; Path=/; Secure; Partitioned; Max-Age=0","topUrl":"https://site-a.example/"}')
+check "删除动作（无目标）" '"action":"deleted"' "$R"
+check "提示不影响其他分区" "不影响其他分区" "$R"
+
+echo
+echo "------- Partitioned（CHIPS）发送演算 -------"
+
+echo "== S1. 分区键相同：该分区项 + 普通项发送，其他分区项排除 =="
+# 先补入 site-a 分区项（C9 已删除），制造键不同被排除的场景
+post /api/store '{"url":"https://widget.vendor.com/frame","setCookie":"ch=a2; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://site-a.example/"}' >/dev/null
+R=$(post /api/send '{"url":"https://widget.vendor.com/frame/x","topUrl":"https://site-b.example/p","method":"GET","topLevelNav":true}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "回显请求分区键" '"partitionKey":"https://site-b.example"' "$R"
+check "site-b 分区项发送" "ch=b" "$HDR"
+check "普通项发送" "ch=u" "$HDR"
+check "排除明细（分区键不同）" "≠ 请求分区键" "$R"
+if [[ "$HDR" != *"ch=a2"* ]]; then echo "✅ site-a 分区项键不同不发送"; PASS=$((PASS+1));
+else echo "❌ site-a 分区项被误发"; FAIL=$((FAIL+1)); fi
+
+echo "== S2. 顶层页换成第三分区：两个分区项都排除，仅普通项发送 =="
+R=$(post /api/send '{"url":"https://widget.vendor.com/","topUrl":"https://site-c.example/","method":"GET","topLevelNav":true}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "仅普通项发送" "ch=u" "$HDR"
+if [[ "$HDR" != *"ch=b"* ]]; then echo "✅ site-b 分区项跨分区不发送"; PASS=$((PASS+1));
+else echo "❌ 分区项被跨分区发送"; FAIL=$((FAIL+1)); fi
+check "排除明细说明分区键" "Partitioned 分区 cookie 仅在其分区内发送" "$R"
+N_EXCL=$(echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+print(sum(1 for i in d['excluded'] if i['name']=='ch' and i['partitioned'] and '请求分区键' in i['detail']))")
+[ "$N_EXCL" = "2" ] && { echo "✅ 2 个分区项（site-a/site-b）均以分区键不符排除"; PASS=$((PASS+1)); } || { echo "❌ 分区排除条数错误: $N_EXCL"; FAIL=$((FAIL+1)); }
+
+echo "== S3. 缺省 topUrl（=请求 URL）：分区键按请求 URL 计算，分区项不匹配 =="
+R=$(post /api/send '{"url":"https://widget.vendor.com/"}')
+check "分区键缺省回退为请求站" '"partitionKey":"https://vendor.com"' "$R"
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+if [[ "$HDR" != *"ch=b"* ]]; then echo "✅ 分区项在缺省上下文不发送"; PASS=$((PASS+1));
+else echo "❌ 缺省上下文误发分区项"; FAIL=$((FAIL+1)); fi
+
+echo "== S4. IP / localhost 分区键用完整主机（端口忽略，scheme 参与） =="
+post /api/store '{"url":"https://widget.vendor.com/","setCookie":"chip=1; Path=/; Secure; SameSite=None; Partitioned","topUrl":"http://192.168.1.6/"}' >/dev/null
+R=$(post /api/send '{"url":"https://widget.vendor.com/","topUrl":"http://192.168.1.6:8080/a"}')
+check "IP 分区键完整主机" '"partitionKey":"http://192.168.1.6"' "$R"
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "同 IP（忽略端口）分区项发送" "chip=1" "$HDR"
+R=$(post /api/send '{"url":"https://widget.vendor.com/","topUrl":"http://192.168.1.7/"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+if [[ "$HDR" != *"chip=1"* ]]; then echo "✅ 不同 IP 跨分区不发送"; PASS=$((PASS+1));
+else echo "❌ 不同 IP 误发"; FAIL=$((FAIL+1)); fi
+R=$(post /api/send '{"url":"https://widget.vendor.com/","topUrl":"https://192.168.1.6/"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+if [[ "$HDR" != *"chip=1"* ]]; then echo "✅ scheme 不同（http vs https）分区键不同，不发送"; PASS=$((PASS+1));
+else echo "❌ schemeful 分区键判定错误"; FAIL=$((FAIL+1)); fi
+
+echo "== S5. 分区项同样受 Secure / Domain / Path / SameSite 约束 =="
+# chip 是 Secure，明文 http 请求即便分区键相同也应被 Secure 规则排除（widget 是 https 主机，这里换明文同主机名）
+R=$(post /api/send '{"url":"http://widget.vendor.com/","topUrl":"http://192.168.1.6/"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+if [[ "$HDR" != *"chip=1"* ]]; then echo "✅ 明文 http 不发送 Secure 分区项"; PASS=$((PASS+1));
+else echo "❌ 分区项绕过 Secure 限制"; FAIL=$((FAIL+1)); fi
+# 不相关主机：分区键相同但 Domain 不匹配，排除（检查 Cookie 头而非整个 JSON，排除项也会含 chip=1 字样）
+R=$(post /api/send '{"url":"https://other.host.net/","topUrl":"http://192.168.1.6/"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "分区键相同但主机不匹配仍排除" "host-only cookie 仅匹配原主机" "$R"
+if [[ "$HDR" != *"chip=1"* ]]; then echo "✅ chip 未出现在其他主机的 Cookie 头（$HDR）"; PASS=$((PASS+1));
+else echo "❌ chip 误发到其他主机"; FAIL=$((FAIL+1)); fi
+
+post /api/reset '{}' >/dev/null
+
+echo "== S6. 分区项计入域级与全局容量 =="
+post /api/capacity '{"globalLimit":3,"domainLimits":{"vendor.com":2}}' >/dev/null
+post /api/store '{"url":"https://w.vendor.com/","setCookie":"k=1; Path=/; Secure; Partitioned","topUrl":"https://a.example/"}' >/dev/null
+post /api/store '{"url":"https://w.vendor.com/","setCookie":"k=2; Path=/; Secure; Partitioned","topUrl":"https://b.example/"}' >/dev/null
+R=$(post /api/store '{"url":"https://w.vendor.com/","setCookie":"k=3; Path=/; Secure; Partitioned","topUrl":"https://c.example/"}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+stages=d['eviction']['stages']
+ds=stages[0]
+assert ds['scope']=='domain' and ds['domain']=='vendor.com', ds
+assert ds['beforeCount']==3 and ds['triggered'], ds
+assert ds['removed'][0]['partitioned'] is True and ds['removed'][0]['partitionKey']=='https://a.example', ds
+assert d['capacity']['totalCount']==2, d['capacity']
+print('✅ 3 个不同分区项同计 vendor.com 桶，超限按规则淘汰且报告带分区键；全局总数=2')" && PASS=$((PASS+1)) || { echo "❌ 分区项容量统计错误"; FAIL=$((FAIL+1)); }
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

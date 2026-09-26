@@ -13,10 +13,14 @@
  *   - SameSite 解析 Strict/Lax/None（大小写不敏感）；未声明或非法值记为默认 Lax；
  *     SameSite=None 未同时声明 Secure 时拒绝入罐。
  *   - Priority（RFC 6265bis）解析 Low/Medium/High（大小写不敏感）；缺省或非法值按 Medium 并提示。
+ *   - Partitioned（CHIPS 独立分区 cookie）：仅当同时带 Secure、且写入时传入的顶层页面 URL
+ *     为有效 http(s) 地址时才入罐；分区键 = 顶层 URL 的 scheme + 可注册域
+ *     （IP、localhost 用完整主机）。存储身份包含分区键：普通项（未分区）与各分区项即使
+ *     同名同域同路径也并存；覆盖更新与 Max-Age 删除只作用于对应分区。
  *
  *  容量压力模拟（入罐沿用上述全部校验通过后执行）：
  *   - 容量按「条目条数」计，可分别为每个可注册域（eTLD+1；IP/localhost 按完整主机）
- *     与全局设置上限，未设置表示不限；
+ *     与全局设置上限，未设置表示不限；普通项与各分区项一律计入域级 / 全局用量；
  *   - 入罐（含覆盖更新）成功后依次执行「域级 → 全局」淘汰；修改容量设置时立即执行一次；
  *   - 仅当范围内条数超过上限才触发：先物理清理范围内已过期项，若仍超限，再按
  *     Priority 从低到高（Low→Medium→High）、最近访问时间从早到晚、创建序号从小到大
@@ -34,6 +38,9 @@
  *       · 显式 Lax：同站，或跨站顶层导航的安全方法（GET/HEAD/OPTIONS/TRACE）；
  *       · 默认 Lax（未声明或非法值）：同上，另允许创建不超过 120 秒的跨站顶层 POST；
  *       · None：跨站照常发送（入罐时已强制要求 Secure）；
+ *   - Partitioned 分区演算（先于 SameSite 检查）：分区 cookie 仅在当前分区键
+ *     （顶层页面 URL 的 scheme + 可注册域；IP、localhost 用完整主机）与其存储分区键
+ *     完全一致时才发送，否则列入排除明细并说明原因；普通项不受分区限制。
  *   - 排序：Path 长度降序；相同长度按首次创建顺序（creation index）升序。
  */
 import { getDomain } from 'tldts';
@@ -63,6 +70,10 @@ export interface StoredCookie {
   priority: CookiePriority;
   /** true = Priority 为默认值（未声明或非法值） */
   priorityDefault: boolean;
+  /** true = 带 Partitioned 属性（CHIPS 独立分区 cookie） */
+  partitioned: boolean;
+  /** 分区键 = 顶层 URL 的 scheme + 可注册域（IP、localhost 用完整主机）；普通项为 null */
+  partitionKey: string | null;
   /** 过期绝对时间戳（ms）；undefined 表示会话 cookie（本工具中永不过期，重启清空） */
   expiresAt?: number;
   /** 首次创建序号，从 1 开始；更新同名项时沿用，保证排序稳定 */
@@ -96,6 +107,8 @@ export interface ParsedSetCookie {
   priorityDefault: boolean;
   /** 原始 Priority 值是否非法（缺省不算非法，非法值才提示） */
   priorityInvalid: boolean;
+  /** 是否带 Partitioned 属性（无值的布尔属性，CHIPS 独立分区 cookie） */
+  partitioned: boolean;
 }
 
 /** 前端表格 / API 共用的展示视图 */
@@ -117,6 +130,12 @@ export interface CookieView {
   priorityDefault: boolean;
   /** 展示用标签：High / Medium（默认）/ Low */
   priorityLabel: string;
+  /** true = 带 Partitioned 属性的分区 cookie */
+  partitioned: boolean;
+  /** 分区键（scheme + 可注册域；IP、localhost 用完整主机）；普通项为 null */
+  partitionKey: string | null;
+  /** 展示用标签：普通项「未分区」，分区项显示分区键 */
+  partitionLabel: string;
   persistent: boolean;
   expiresAt: string | null;
   remaining: string | null;
@@ -140,6 +159,10 @@ export interface EvictedCookie {
   domain: string;
   hostOnly: boolean;
   path: string;
+  /** true = 分区 cookie（淘汰清单一并展示分区键） */
+  partitioned: boolean;
+  /** 分区键；普通项为 null */
+  partitionKey: string | null;
   priority: CookiePriority;
   priorityLabel: string;
   expired: boolean;
@@ -219,20 +242,34 @@ export interface RequestItem {
   secure: boolean;
   sameSite: SameSiteMode;
   sameSiteLabel: string;
+  /** true = 分区 cookie（发送 / 排除项都展示其分区键） */
+  partitioned: boolean;
+  /** 该 cookie 存储时的分区键；普通项为 null */
+  partitionKey: string | null;
   verdict: ItemVerdict;
   /** 发送：命中的匹配点；排除：排除原因 */
   detail: string;
   expired: boolean;
 }
 
-/** 发送演算的附加上下文（SameSite 判定所需） */
+/** 发送演算的附加上下文（SameSite 与 Partitioned 判定所需） */
 export interface SendOptions {
-  /** 顶层页面 URL（决定 same-site 上下文）；缺省视为与请求 URL 相同，即同站 */
+  /** 顶层页面 URL（决定 same-site 上下文与分区 cookie 的当前分区键）；缺省视为与请求 URL 相同，即同站/第一方分区 */
   topUrl?: string;
   /** 请求方法（大小写不敏感），缺省 GET */
   method?: string;
   /** 是否顶层导航，缺省 true */
   topLevelNav?: boolean;
+}
+
+/** 写入演算的附加上下文（Partitioned 分区键所需） */
+export interface StoreOptions {
+  /**
+   * 顶层页面 URL：仅当 Set-Cookie 带 Partitioned 时使用，
+   * 以此计算分区键（scheme + 可注册域；IP、localhost 用完整主机）；
+   * 未分区 cookie 传入也会被忽略。
+   */
+  topUrl?: string;
 }
 
 export interface SendResult {
@@ -250,6 +287,8 @@ export interface SendResult {
   /** 请求站 / 顶层站（scheme + 可注册域；IP、localhost 按完整主机） */
   requestSite: string;
   topSite: string;
+  /** 当前请求的分区键（即顶层站 topSite）：分区 cookie 仅当存储分区键与之相等时发送 */
+  partitionKey: string;
   /** 请求站与顶层站是否同站 */
   sameSiteContext: boolean;
   cookieHeader: string;
@@ -342,6 +381,7 @@ export function parseSetCookie(raw: string): ParsedSetCookie {
     priority: 'medium',
     priorityDefault: true,
     priorityInvalid: false,
+    partitioned: false,
   };
 
   for (let i = 1; i < segments.length; i += 1) {
@@ -373,6 +413,10 @@ export function parseSetCookie(raw: string): ParsedSetCookie {
         break;
       case 'httponly':
         parsed.httpOnly = true;
+        break;
+      case 'partitioned':
+        // CHIPS 独立分区 cookie：无值布尔属性（即便带值也仅按存在处理）
+        parsed.partitioned = true;
         break;
       case 'samesite': {
         // Strict / Lax / None，大小写不敏感；未声明或非法值一律记为默认 Lax
@@ -524,9 +568,15 @@ export class CookieJar {
 
   /**
    * 按顺序处理一次「响应 URL + 单条 Set-Cookie」写入。
+   * 带 Partitioned 的 cookie 还需通过 options.topUrl 传入顶层页面 URL 以确定分区键。
    * 返回动作（入罐 / 更新 / 删除 / 拒绝）及原因。
    */
-  store(responseUrl: string, setCookieHeader: string, now: number = Date.now()): StoreResult {
+  store(
+    responseUrl: string,
+    setCookieHeader: string,
+    options: StoreOptions = {},
+    now: number = Date.now(),
+  ): StoreResult {
     const urlInfo = hostFromUrl(responseUrl);
     if (!urlInfo) {
       return this.result(false, 'rejected', `响应 URL 非法或非 http(s)：${responseUrl}`, []);
@@ -624,23 +674,63 @@ export class CookieJar {
       notices.push('Priority 属性缺省，已按默认 Medium 参与容量淘汰');
     }
 
-    const existing = this.findCookie(parsed.name, domain, cookiePath);
+    // ---- 3.6 Partitioned（CHIPS）：必须同时带 Secure，且顶层页面 URL 为有效 http(s) 地址 ----
+    let partitionKey: string | null = null;
+    if (parsed.partitioned) {
+      if (!parsed.secure) {
+        return this.result(
+          false,
+          'rejected',
+          'Partitioned cookie 必须同时声明 Secure（CHIPS 独立分区 cookie 仅允许安全上下文），拒绝入罐',
+          notices,
+          parsed,
+        );
+      }
+      const topRaw = typeof options.topUrl === 'string' ? options.topUrl.trim() : '';
+      if (topRaw === '') {
+        return this.result(
+          false,
+          'rejected',
+          'Set-Cookie 带 Partitioned 属性，但写入时未提供顶层页面 URL（字段 topUrl），无法确定分区键，拒绝入罐',
+          notices,
+          parsed,
+        );
+      }
+      const topInfo = hostFromUrl(topRaw);
+      if (!topInfo) {
+        return this.result(
+          false,
+          'rejected',
+          `Partitioned 的顶层页面 URL 非法或非 http(s)：${topRaw}，无法计算分区键，拒绝入罐`,
+          notices,
+          parsed,
+        );
+      }
+      partitionKey = siteOf(topInfo.host, topInfo.protocol);
+      notices.push(`Partitioned 分区 cookie：分区键取顶层页面 URL 的 scheme + 可注册域 = ${partitionKey}`);
+    }
 
-    // ---- 4. Max-Age <= 0：删除同名 (name, domain, path) 项 ----
+    const identityText = parsed.partitioned
+      ? `分区键=${partitionKey}`
+      : '未分区（普通项）';
+    const existing = this.findCookie(parsed.name, domain, cookiePath, partitionKey);
+
+    // ---- 4. Max-Age <= 0：删除同名 (name, domain, path, partitionKey) 项 ----
     if (parsed.maxAge !== undefined && parsed.maxAge <= 0) {
       if (existing) {
         this.cookies = this.cookies.filter((c) => c !== existing);
         return this.result(
           true,
           'deleted',
-          `Max-Age=${parsed.maxAge}（≤0），已删除同名同域同路径项 ${parsed.name}=…（#${existing.creationIndex}，domain=${domain}，path=${cookiePath}）`,
+          `Max-Age=${parsed.maxAge}（≤0），已删除${parsed.partitioned ? '该分区内' : ''}同名同域同路径项 ${parsed.name}=…` +
+            `（#${existing.creationIndex}，domain=${domain}，path=${cookiePath}，${identityText}）；其他分区 / 普通同名项不受影响`,
           notices,
         );
       }
       return this.result(
         true,
         'deleted',
-        `Max-Age=${parsed.maxAge}（≤0）要求删除 ${parsed.name}，但罐中不存在 domain=${domain}、path=${cookiePath} 的同名项，无可删除`,
+        `Max-Age=${parsed.maxAge}（≤0）要求删除 ${parsed.name}，但罐中不存在 domain=${domain}、path=${cookiePath}、${identityText} 的同名项，无可删除`,
         notices,
       );
     }
@@ -651,7 +741,7 @@ export class CookieJar {
       expiresAt = Math.min(now + parsed.maxAge * 1000, MAX_SAFE_EXPIRES);
     }
 
-    // ---- 6. 入罐或更新（同名同域同路径覆盖，沿用首次创建序号）----
+    // ---- 6. 入罐或更新（同名同域同路径同分区覆盖，沿用首次创建序号）----
     if (existing) {
       existing.value = parsed.value;
       existing.hostOnly = hostOnly;
@@ -661,6 +751,8 @@ export class CookieJar {
       existing.sameSiteDefault = parsed.sameSiteDefault;
       existing.priority = parsed.priority;
       existing.priorityDefault = parsed.priorityDefault;
+      existing.partitioned = parsed.partitioned;
+      existing.partitionKey = partitionKey;
       existing.expiresAt = expiresAt;
       existing.updatedAt = now;
       // 覆盖更新视为一次访问（RFC 6265bis creation/access-time 语义）
@@ -673,7 +765,8 @@ export class CookieJar {
       return {
         ok: true,
         action: 'updated',
-        reason: `同名同域同路径的 ${parsed.name} 已存在（#${existing.creationIndex}），覆盖更新（value/属性以新 Set-Cookie 为准，创建顺序沿用）；Priority=${priorityLabel(parsed.priority, parsed.priorityDefault)}`,
+        reason: `同名同域同路径${parsed.partitioned ? '同分区' : ''}的 ${parsed.name} 已存在（#${existing.creationIndex}，${identityText}），覆盖更新（value/属性以新 Set-Cookie 为准，创建顺序沿用）；Priority=${priorityLabel(parsed.priority, parsed.priorityDefault)}` +
+          (parsed.partitioned ? '' : '；其他分区的同名项不受影响'),
         inheritedIndex: existing.creationIndex,
         notices,
         cookie: this.toView(existing, now),
@@ -694,6 +787,8 @@ export class CookieJar {
       sameSiteDefault: parsed.sameSiteDefault,
       priority: parsed.priority,
       priorityDefault: parsed.priorityDefault,
+      partitioned: parsed.partitioned,
+      partitionKey,
       expiresAt,
       creationIndex: this.nextIndex,
       createdAt: now,
@@ -703,7 +798,7 @@ export class CookieJar {
     this.nextIndex += 1;
     this.cookies.push(stored);
 
-    // ---- 7. 容量压力：依次执行域级、全局淘汰 ----
+    // ---- 7. 容量压力：依次执行域级、全局淘汰（普通项与分区项一并计入用量）----
     const eviction = this.enforceAfterStore(stored, now);
     this.appendEvictionNotices(notices, eviction);
     const survived = !eviction || !eviction.removed.some((r) => r.index === stored.creationIndex);
@@ -717,10 +812,13 @@ export class CookieJar {
         : `Max-Age=${parsed.maxAge}s，将于 ${formatTime(expiresAt)} 过期`;
     const sameSiteText = `SameSite=${sameSiteLabel(parsed.sameSite, parsed.sameSiteDefault)}`;
     const priorityText = `Priority=${priorityLabel(parsed.priority, parsed.priorityDefault)}`;
+    const partitionText = parsed.partitioned
+      ? `Partitioned 分区项（${identityText}）；仅在顶层站同为该分区键的请求中发送`
+      : '未分区普通项';
     return this.result(
       true,
       'stored',
-      `已入罐：${parsed.name}=${parsed.value}；${scopeText}；Path=${cookiePath}；${sameSiteText}；${priorityText}；${lifeText}` +
+      `已入罐：${parsed.name}=${parsed.value}；${scopeText}；Path=${cookiePath}；${sameSiteText}；${priorityText}；${partitionText}；${lifeText}` +
         (survived ? '' : '（随后即因容量压力被淘汰，详见淘汰清单）'),
       notices,
       parsed,
@@ -732,8 +830,9 @@ export class CookieJar {
 
   /**
    * 对请求演算 Cookie 头。
-   * 除请求 URL 外还需 SameSite 上下文：顶层页面 URL、请求方法、是否顶层导航
-   * （缺省：顶层页 = 请求 URL、GET、顶层导航，即同站安全方法，全部 SameSite 模式放行）。
+   * 除请求 URL 外还需 SameSite / Partitioned 上下文：顶层页面 URL、请求方法、是否顶层导航
+   * （缺省：顶层页 = 请求 URL、GET、顶层导航，即同站安全方法，全部 SameSite 模式放行；
+   * 此时当前分区键 = 请求站，仅第一方分区的分区项可发送）。
    * 逐项给出 send / exclude 及原因；发送项按 Path 长度降序、首次创建顺序升序排列。
    */
   send(requestUrl: string, options: SendOptions = {}, now: number = Date.now()): SendResult {
@@ -764,6 +863,8 @@ export class CookieJar {
     // same-site = scheme + 可注册域（IP / localhost 按完整主机）
     const requestSite = siteOf(host, protocol);
     const topSite = siteOf(topInfo.host, topInfo.protocol);
+    // 当前请求的分区键 = 顶层站；分区 cookie 仅当存储分区键与之相等时发送
+    const partitionKey = topSite;
     const sameSiteContext = requestSite === topSite;
     const safeMethod = SAFE_METHODS.has(method);
     const siteCompare = `请求站 ${requestSite} ${sameSiteContext ? '=' : '≠'} 顶层站 ${topSite}`;
@@ -785,6 +886,8 @@ export class CookieJar {
         secure: c.secure,
         sameSite: c.sameSite,
         sameSiteLabel: label,
+        partitioned: c.partitioned,
+        partitionKey: c.partitionKey,
         verdict: 'exclude',
         detail: '',
         expired,
@@ -814,6 +917,15 @@ export class CookieJar {
         continue;
       }
 
+      // ---- Partitioned 分区演算（先于 SameSite）：仅同分区键可发送 ----
+      if (c.partitioned && c.partitionKey !== partitionKey) {
+        base.detail =
+          `Partitioned 分区 cookie：存储分区键为 ${c.partitionKey}，当前请求分区键（顶层站）为 ${partitionKey}，` +
+          `两者不一致，不发送（CHIPS：分区 cookie 仅在所属顶层站点的分区内发送；${siteCompare}）`;
+        excluded.push(base);
+        continue;
+      }
+
       // ---- SameSite 站点演算 ----
       const ssVerdict = this.sameSiteVerdict(c, label, {
         sameSiteContext,
@@ -831,8 +943,12 @@ export class CookieJar {
 
       base.verdict = 'send';
       const hostWay = c.hostOnly ? '主机精确相等' : `主机 ${host} 命中域 ${c.domain}`;
+      const partitionNote = c.partitioned
+        ? `；Partitioned 分区键匹配（${partitionKey}）`
+        : '';
       base.detail = `匹配通过：${hostWay}；request-path "${path}" 命中 cookie-path "${c.path}"` +
         (c.secure ? '；https 满足 Secure' : '') +
+        partitionNote +
         `；${ssVerdict.note}`;
       // 发送成功即「访问」：刷新最近访问时间（容量淘汰 LRA 依据）
       c.lastAccessedAt = now;
@@ -861,6 +977,7 @@ export class CookieJar {
       topLevelNav,
       requestSite,
       topSite,
+      partitionKey,
       sameSiteContext,
       cookieHeader,
       sent,
@@ -916,8 +1033,14 @@ export class CookieJar {
 
   // ---------------- 内部辅助 ----------------
 
-  private findCookie(name: string, domain: string, path: string): StoredCookie | undefined {
-    return this.cookies.find((c) => c.name === name && c.domain === domain && c.path === path);
+  private findCookie(name: string, domain: string, path: string, partitionKey: string | null): StoredCookie | undefined {
+    return this.cookies.find(
+      (c) =>
+        c.name === name &&
+        c.domain === domain &&
+        c.path === path &&
+        c.partitionKey === partitionKey,
+    );
   }
 
   /**
@@ -1009,6 +1132,7 @@ export class CookieJar {
       topLevelNav: false,
       requestSite: '',
       topSite: '',
+      partitionKey: '',
       sameSiteContext: false,
       cookieHeader: '',
       sent: [],
@@ -1034,6 +1158,9 @@ export class CookieJar {
       priority: c.priority,
       priorityDefault: c.priorityDefault,
       priorityLabel: priorityLabel(c.priority, c.priorityDefault),
+      partitioned: c.partitioned,
+      partitionKey: c.partitionKey,
+      partitionLabel: c.partitioned ? `分区 · ${c.partitionKey ?? ''}` : '未分区',
       persistent: c.expiresAt !== undefined,
       expiresAt: c.expiresAt === undefined ? null : formatTime(c.expiresAt),
       remaining: c.expiresAt === undefined ? null : expired ? '已过期' : formatRemaining(c.expiresAt, now),
@@ -1190,6 +1317,8 @@ export class CookieJar {
       domain: c.domain,
       hostOnly: c.hostOnly,
       path: c.path,
+      partitioned: c.partitioned,
+      partitionKey: c.partitionKey,
       priority: c.priority,
       priorityLabel: priorityLabel(c.priority, c.priorityDefault),
       expired,

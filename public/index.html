@@ -28,9 +28,15 @@
         </label>
 
         <label class="field">
-          <span class="field-label">单条 Set-Cookie（不含 <code>Set-Cookie:</code> 前缀；支持 <code>Priority=Low/Medium/High</code>）</span>
+          <span class="field-label">顶层页面 URL（仅 <code>Partitioned</code> 分区 cookie 必需；据此计算分区键 = scheme + 可注册域）</span>
+          <input id="store-top-url" type="text" spellcheck="false" autocomplete="off"
+            placeholder="例如：https://portal.example/（嵌入第三方 iframe 时的顶层页面）；普通 cookie 留空即可" />
+        </label>
+
+        <label class="field">
+          <span class="field-label">单条 Set-Cookie（不含 <code>Set-Cookie:</code> 前缀；支持 <code>Priority=Low/Medium/High</code> 与 <code>Partitioned</code>）</span>
           <input id="store-cookie" type="text" spellcheck="false" autocomplete="off"
-            placeholder='例如：session=abc123; Domain=example.com; Path=/; Max-Age=3600; Secure; Priority=High' />
+            placeholder='例如：sid=chips; Secure; SameSite=None; Partitioned; Max-Age=3600' />
         </label>
 
         <div class="row">
@@ -51,7 +57,7 @@
         </label>
 
         <label class="field">
-          <span class="field-label">顶层页面 URL（SameSite 站点判定的基准；留空 = 与请求 URL 同站）</span>
+          <span class="field-label">顶层页面 URL（SameSite 站点判定与 Partitioned 分区键的基准；留空 = 与请求 URL 同站/同分区）</span>
           <input id="send-top-url" type="text" spellcheck="false" autocomplete="off"
             placeholder="例如：https://shop.example.com/cart（跨站可填 https://other.org/）" />
         </label>
@@ -136,6 +142,7 @@
         <li><strong>Secure：</strong>仅在 https 请求中发送；明文 http 响应中设置 Secure 会给出提示。</li>
         <li><strong>SameSite：</strong>解析 <code>Strict / Lax / None</code>（大小写不敏感）；未声明或非法值记为<strong>默认 Lax</strong>；<code>SameSite=None</code> 未带 <code>Secure</code> 时<strong>拒绝入罐</strong>。</li>
         <li><strong>Priority：</strong>解析 <code>Low / Medium / High</code>（大小写不敏感）；<strong>缺省或非法值按 Medium</strong>（非法值会给出提示）。容量淘汰时低优先级先出局。</li>
+        <li><strong>Partitioned（CHIPS 独立分区）：</strong>带 <code>Partitioned</code> 的 Set-Cookie <strong>必须同时带 <code>Secure</code>、且写入时提供有效 http(s) 的顶层页面 URL</strong>，否则拒绝入罐；分区键 = 顶层 URL 的 <strong>scheme + 可注册域</strong>（IP、localhost 用完整主机）。普通项与各分区项即使同名同域同路径也<strong>并存</strong>；覆盖与 <code>Max-Age&lt;=0</code> 删除只影响对应分区。发送时分区 cookie 仅在当前分区键（顶层站）与其存储分区键<strong>相同</strong>时发送，否则在排除明细中说明原因。分区项同样计入域级与全局容量。</li>
         <li><strong>容量压力：</strong>可分别为每个<strong>可注册域</strong>（eTLD+1；IP / localhost 按完整主机）与<strong>全局</strong>设置条目数上限。入罐通过全部校验后，<strong>先执行域级淘汰、再执行全局淘汰</strong>；仅在范围内条数超限时动作：<strong>先清理过期项</strong>，仍超限再按 <strong>Priority 低→高、最近访问时间早→晚、创建序号小→大</strong> 依次淘汰，直到回到上限。修改容量设置会立即执行一次。</li>
         <li><strong>最近访问（LRA）：</strong>创建 / 覆盖更新时写入访问时间；条目<strong>发送成功</strong>即刷新。同级 Priority 中越久未访问越先被淘汰。</li>
         <li><strong>站点（site）：</strong>scheme + 可注册域（eTLD+1，由公共后缀列表 PSL 判定，如 <code>https://example.com</code>）；IP 与 localhost 按完整主机比较。请求站 = 顶层站即「同站」。</li>

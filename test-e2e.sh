@@ -440,6 +440,135 @@ post /api/reset '{}' >/dev/null
 post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
 
 echo
+echo "------- Partitioned（CHIPS）分区写入演算 -------"
+
+echo "== C1. Partitioned 未带 Secure -> 拒绝 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"https://portal.chips/","setCookie":"cp_bad=1; Path=/; SameSite=Lax; Partitioned"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（必须 Secure）" "Partitioned cookie 必须同时声明 Secure" "$R"
+
+echo "== C2. Partitioned 未提供顶层页面 URL -> 拒绝 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","setCookie":"cp_notop=1; Path=/; Secure; Partitioned"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（缺少 topUrl）" "未提供顶层页面 URL" "$R"
+
+echo "== C3. Partitioned 顶层 URL 非法 -> 拒绝 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"not-a-url","setCookie":"cp_badurl=1; Path=/; Secure; Partitioned"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（顶层 URL 非法）" "顶层页面 URL 非法或非 http(s)" "$R"
+
+echo "== C4. Partitioned + Secure + 顶层 URL（portal）-> 入罐，分区键 = scheme+eTLD+1 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"https://www.portal.chips/home","setCookie":"cp=portal; Path=/; Secure; SameSite=None; Partitioned"}')
+check "入罐" '"action":"stored"' "$R"
+check "标记 partitioned" '"partitioned":true' "$R"
+check "分区键 portal" '"partitionKey":"https://portal.chips"' "$R"
+check "分区键提示" "分区键取顶层页面 URL" "$R"
+
+echo "== C5. 同名同域同路径、不同分区键 -> 并存独立项 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"https://shop.chips/","setCookie":"cp=shop; Path=/; Secure; SameSite=None; Partitioned"}')
+check "另存一条（非覆盖）" '"action":"stored"' "$R"
+check "分区键 shop" '"partitionKey":"https://shop.chips"' "$R"
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","setCookie":"cp=plain; Path=/"}')
+check "普通同名项也并存" '"action":"stored"' "$R"
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+cs=json.load(sys.stdin)['cookies']
+rows=sorted((c['value'], c['partitioned'], c['partitionKey']) for c in cs if c['name']=='cp')
+assert rows==[('plain',False,None),('portal',True,'https://portal.chips'),('shop',True,'https://shop.chips')], rows
+print('✅ 普通项 + 两个分区项同名同域同路径并存为 3 条')" && PASS=$((PASS+1)) || { echo "❌ 分区并存错误"; FAIL=$((FAIL+1)); }
+
+echo "== C6. 覆盖只影响对应分区（portal），shop / 普通项不动 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"https://www.portal.chips/x","setCookie":"cp=portal2; Path=/; Secure; SameSite=None; Partitioned"}')
+check "更新动作" '"action":"updated"' "$R"
+check "沿用创建序号" '"inheritedIndex":1' "$R"
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+cs=json.load(sys.stdin)['cookies']
+vals=sorted((c['value'], c['partitionKey']) for c in cs if c['name']=='cp')
+assert ('portal2','https://portal.chips') in vals and ('shop','https://shop.chips') in vals and ('plain',None) in vals, vals
+assert len(vals)==3, vals
+print('✅ 仅 portal 分区被覆盖，shop 分区与普通项保留')" && PASS=$((PASS+1)) || { echo "❌ 分区覆盖越界"; FAIL=$((FAIL+1)); }
+
+echo "== C7. IP / localhost 顶层主机按完整主机作分区键 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"https://10.2.3.4/","setCookie":"cpip=1; Path=/; Secure; Partitioned"}')
+check "IP 分区键为完整主机" '"partitionKey":"https://10.2.3.4"' "$R"
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"http://localhost:9000/","setCookie":"cplo=1; Path=/; Secure; Partitioned"}')
+check "localhost 分区键（忽略端口）" '"partitionKey":"http://localhost"' "$R"
+
+echo
+echo "------- Partitioned（CHIPS）分区发送演算 -------"
+
+echo "== D1. 顶层站 = portal 分区：仅 portal 分区项发送，shop 分区项进排除明细 =="
+R=$(post /api/send '{"url":"https://ads.chips.test/widget","topUrl":"https://www.portal.chips/home","method":"GET","topLevelNav":false}')
+check "回显分区键" '"partitionKey":"https://portal.chips"' "$R"
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "portal 分区项发送" "cp=portal2" "$HDR"
+if [[ "$HDR" != *"cp=shop"* ]]; then echo "✅ shop 分区项不发送"; PASS=$((PASS+1));
+else echo "❌ shop 分区项被误发"; FAIL=$((FAIL+1)); fi
+check "shop 分区排除原因（键不一致）" "当前请求分区键（顶层站）为 https://portal.chips" "$R"
+check "排除原因含 CHIPS 说明" "CHIPS" "$R"
+
+echo "== D2. 顶层站换成 other.org：两个分区项都因分区键不一致被排除 =="
+R=$(post /api/send '{"url":"https://ads.chips.test/widget","topUrl":"https://other.org/","method":"GET","topLevelNav":false}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+if [[ "$HDR" != *"cp=portal2"* ]] && [[ "$HDR" != *"cp=shop"* ]]; then echo "✅ 无任何分区项发送"; PASS=$((PASS+1));
+else echo "❌ 不一致分区被误发（$HDR）"; FAIL=$((FAIL+1)); fi
+check "排除计数包含两个分区项" "存储分区键为 https://shop.chips" "$R"
+
+echo "== D3. 顶层页留空（=请求站 https://ads.chips.test）：分区项均不匹配，普通项第一方可发 =="
+R=$(post /api/send '{"url":"https://ads.chips.test/widget","method":"GET"}')
+check "分区键取请求站" '"partitionKey":"https://chips.test"' "$R"
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "普通项同站发送" "cp=plain" "$HDR"
+if [[ "$HDR" != *"cp=portal2"* ]] && [[ "$HDR" != *"cp=shop"* ]]; then echo "✅ 第一方分区键不匹配已存分区"; PASS=$((PASS+1));
+else echo "❌ 分区项不应在第一方上下文发送"; FAIL=$((FAIL+1)); fi
+
+echo "== D4. schemeful：http 与 https 顶层站分区键不同 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"https://sec.chips/","setCookie":"cps=1; Path=/; Secure; SameSite=None; Partitioned"}')
+check "https 分区入罐" '"partitionKey":"https://sec.chips"' "$R"
+R=$(post /api/send '{"url":"https://ads.chips.test/widget","topUrl":"http://sec.chips/","method":"GET","topLevelNav":false}')
+check "scheme 不同分区键不同，被排除" "存储分区键为 https://sec.chips" "$R"
+R=$(post /api/send '{"url":"https://ads.chips.test/widget","topUrl":"https://sec.chips/","method":"GET","topLevelNav":false}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieHeader'])")
+check "同分区键发送" "cps=1" "$HDR"
+
+echo "== D5. Max-Age=0 只删除对应分区项 =="
+R=$(post /api/store '{"url":"https://ads.chips.test/widget","topUrl":"https://www.portal.chips/","setCookie":"cp=z; Path=/; Secure; Partitioned; Max-Age=0"}')
+check "删除动作" '"action":"deleted"' "$R"
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+cs=json.load(sys.stdin)['cookies']
+vals=sorted((c['value'], c['partitionKey']) for c in cs if c['name']=='cp')
+assert ('portal2','https://portal.chips') not in vals, vals
+assert ('shop','https://shop.chips') in vals and ('plain',None) in vals, vals
+print('✅ portal 分区项被删，shop 分区与普通项保留')" && PASS=$((PASS+1)) || { echo "❌ 分区删除越界"; FAIL=$((FAIL+1)); }
+
+echo "== D6. 分区项计入域级与全局容量 =="
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":2,"domainLimits":{"chips.test":2}}' >/dev/null
+post /api/store '{"url":"https://ads.chips.test/","topUrl":"https://a.part/","setCookie":"d1=1; Path=/; Secure; Partitioned"}' >/dev/null
+post /api/store '{"url":"https://ads.chips.test/","topUrl":"https://b.part/","setCookie":"d2=2; Path=/; Secure; Partitioned"}' >/dev/null
+R=$(post /api/store '{"url":"https://ads.chips.test/","setCookie":"d3=3; Path=/; Priority=Low"}')
+echo "$R" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+scopes=[s['scope'] for s in d['eviction']['stages'] if s['triggered']]
+assert 'domain' in scopes, scopes
+removed=[r['cookie'] for s in d['eviction']['stages'] for r in s['removed']]
+assert 'd3=3' in removed, removed
+cap=d['capacity']
+assert cap['totalCount']==2, cap['totalCount']
+u=[x for x in cap['usage'] if x['domain']=='chips.test'][0]
+assert (u['count'],u['limit'])==(2,2), u
+print('✅ 两个分区项 + 普通项同计入 chips.test 域级 / 全局容量，超限触发淘汰')" && PASS=$((PASS+1)) || { echo "❌ 分区容量统计错误"; FAIL=$((FAIL+1)); }
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]
